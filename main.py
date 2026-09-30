@@ -225,7 +225,7 @@ async def download_file_parallel(
                     break
 
                 offset = part_index * PART_SIZE
-                limit = min(PART_SIZE, file_size - offset)
+                limit = PART_SIZE
 
                 for attempt in range(3):
                     try:
