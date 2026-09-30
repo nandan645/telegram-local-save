@@ -34,8 +34,10 @@ MAX_WORKERS = 8         # 8 parallel connections
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger("Downloader")
 
-# Active downloads tracker: {message_id: {"task": Task, "status_msg": Message, "dest": Path, "name": str, "size": int}}
-active_downloads: dict[int, dict] = {}
+# Queue management state
+download_queue: asyncio.Queue = asyncio.Queue()
+queued_items: list[dict] = []
+current_download: dict | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -130,7 +132,6 @@ async def healthcheck_heartbeat_loop() -> None:
             logger.debug("Healthcheck heartbeat ping sent.")
         except Exception as exc:
             logger.warning(f"Healthcheck heartbeat ping failed: {exc}")
-        # Send heartbeat ping every 10 minutes
         await asyncio.sleep(600)
 
 
@@ -259,13 +260,30 @@ async def download_file_parallel(
 
 
 # -----------------------------------------------------------------------------
-# 4. DOWNLOAD TASK WORKER
+# 4. SEQUENTIAL QUEUE WORKER
 # -----------------------------------------------------------------------------
-async def process_download(message, destination: Path, file_size: int | None, status_msg) -> None:
-    """Processes the download lifecycle including progress, completion, and error cleanup."""
+async def process_single_download(item: dict) -> None:
+    """Handles the lifecycle of a single queued download item."""
+    message = item["message"]
+    destination = item["destination"]
+    file_size = item["file_size"]
+    status_msg = item["status_msg"]
+
     start_time = time.time()
     last_update = [0.0]
     mode_state = {"mode": "Fast Parallel (Initializing...)"}
+
+    # Initial start notification
+    try:
+        await status_msg.edit(
+            f"**[STARTING] Download Started**\n\n"
+            f"**File:** `{destination.name}`\n"
+            f"**Size:** `{format_size(file_size)}`\n"
+            f"**Folder:** `{destination.parent}`\n\n"
+            f"_Send /cancel to stop this download._"
+        )
+    except Exception:
+        pass
 
     async def progress_callback(current_bytes: int, total_bytes: int) -> None:
         now = time.time()
@@ -278,13 +296,15 @@ async def process_download(message, destination: Path, file_size: int | None, st
         elapsed = max(0.1, now - start_time)
         speed = current_bytes / elapsed
 
+        queue_note = f" (Queue: {len(queued_items)} waiting)" if queued_items else ""
+
         if total > 0:
             percentage = (current_bytes / total) * 100.0
             eta = (total - current_bytes) / speed if speed > 0 else 0
             bar = create_progress_bar(percentage)
 
             text = (
-                f"**[DOWNLOADING] Progress Update**\n\n"
+                f"**[DOWNLOADING] Progress Update**{queue_note}\n\n"
                 f"**File:** `{destination.name}`\n"
                 f"**Mode:** `{mode_state['mode']}`\n"
                 f"**Progress:** `[{bar}]` **{percentage:.1f}%**\n"
@@ -294,7 +314,7 @@ async def process_download(message, destination: Path, file_size: int | None, st
             )
         else:
             text = (
-                f"**[DOWNLOADING] Progress Update**\n\n"
+                f"**[DOWNLOADING] Progress Update**{queue_note}\n\n"
                 f"**File:** `{destination.name}`\n"
                 f"**Mode:** `{mode_state['mode']}`\n"
                 f"**Downloaded:** `{format_size(current_bytes)}`\n"
@@ -333,7 +353,7 @@ async def process_download(message, destination: Path, file_size: int | None, st
             f"**Saved To:** `{destination}`"
         )
 
-        # Delete the original forwarded message to free cloud storage
+        # Delete original forwarded message
         try:
             await message.delete()
             logger.info(f"Deleted original Telegram message for {destination.name}")
@@ -341,17 +361,20 @@ async def process_download(message, destination: Path, file_size: int | None, st
             logger.warning(f"Could not delete original message: {del_err}")
 
     except asyncio.CancelledError:
-        logger.info(f"Download cancelled by user: {destination.name}")
+        logger.info(f"Download cancelled: {destination.name}")
         if destination.exists():
             try:
                 destination.unlink()
             except OSError:
                 pass
-        await status_msg.edit(
-            f"**[CANCELLED] Download Cancelled by User**\n\n"
-            f"**File:** `{destination.name}`\n"
-            f"**Status:** Download stopped and partial file deleted."
-        )
+        try:
+            await status_msg.edit(
+                f"**[CANCELLED] Download Cancelled**\n\n"
+                f"**File:** `{destination.name}`\n"
+                f"**Status:** Stopped and partial file deleted."
+            )
+        except Exception:
+            pass
 
     except Exception as exc:
         logger.error(f"Failed to download {destination.name}: {exc}")
@@ -360,16 +383,58 @@ async def process_download(message, destination: Path, file_size: int | None, st
                 destination.unlink()
             except OSError:
                 pass
+        try:
+            await status_msg.edit(
+                f"**[ERROR] Download Failed**\n\n"
+                f"**File:** `{destination.name}`\n"
+                f"**Mode:** `{mode_state['mode']}`\n"
+                f"**Reason:** `{type(exc).__name__}: {str(exc)}`"
+            )
+        except Exception:
+            pass
 
-        await status_msg.edit(
-            f"**[ERROR] Download Failed**\n\n"
-            f"**File:** `{destination.name}`\n"
-            f"**Mode:** `{mode_state['mode']}`\n"
-            f"**Reason:** `{type(exc).__name__}: {str(exc)}`"
-        )
 
-    finally:
-        active_downloads.pop(message.id, None)
+async def queue_worker_loop(client: TelegramClient) -> None:
+    """Continuously processes downloads from the queue one by one."""
+    global current_download
+    while True:
+        item = await download_queue.get()
+        if item in queued_items:
+            queued_items.remove(item)
+
+        # Skip if item was cancelled/deleted while sitting in queue
+        if item.get("cancelled", False):
+            download_queue.task_done()
+            continue
+
+        # Double check if message was deleted before starting
+        try:
+            msg_check = await client.get_messages("me", ids=item["message"].id)
+            if not msg_check or not getattr(msg_check, "media", None):
+                logger.info(f"Message {item['message'].id} was deleted before start. Skipping...")
+                try:
+                    await item["status_msg"].delete()
+                except Exception:
+                    pass
+                download_queue.task_done()
+                continue
+        except Exception:
+            pass
+
+        # Set as active download
+        download_task = asyncio.create_task(process_single_download(item))
+        current_download = {
+            "item": item,
+            "task": download_task,
+        }
+
+        try:
+            await download_task
+        except Exception as err:
+            logger.error(f"Worker task error: {err}")
+        finally:
+            current_download = None
+            download_queue.task_done()
 
 
 # -----------------------------------------------------------------------------
@@ -382,12 +447,13 @@ async def handle_help_command(message) -> None:
         "**[HELP] Telegram Saved Messages Downloader**\n\n"
         "**Available Commands:**\n"
         "• `/help` or `/start` — Show this help message\n"
-        "• `/status` — View server disk space and active downloads\n"
-        "• `/cancel` — Cancel ongoing download and delete partial file\n\n"
+        "• `/status` — View server disk space, active download, and queue\n"
+        "• `/cancel` — Cancel active download or a queued item\n\n"
         "**How to Use:**\n"
-        "1. Forward or send any file, video, or document to Saved Messages.\n"
-        "2. The server downloads it automatically at high speed (parallel streams).\n"
-        "3. Once finished, the original forwarded file is auto-deleted from Telegram.\n\n"
+        "1. Forward or send any files to Saved Messages (even 10+ files at once).\n"
+        "2. The server processes them sequentially in a queue at maximum speed (8 streams).\n"
+        "3. Deleting any file from Saved Messages automatically cancels and removes it from queue.\n"
+        "4. Completed files are auto-deleted from Telegram to free cloud storage.\n\n"
         f"**Download Folder:** `{DOWNLOAD_DIR}`\n"
         f"**Server Disk Space:** `{free_space} free / {total_space} total`"
     )
@@ -395,7 +461,7 @@ async def handle_help_command(message) -> None:
 
 
 async def handle_status_command(message) -> None:
-    """Displays server storage and active downloads status."""
+    """Displays server storage, active download, and queue status."""
     free_space, total_space = get_disk_space_info(DOWNLOAD_DIR)
     lines = [
         "**[STATUS] Downloader & Server Status**\n",
@@ -403,42 +469,103 @@ async def handle_status_command(message) -> None:
         f"**Server Storage:** `{free_space} free` of `{total_space}`",
     ]
 
-    if active_downloads:
-        lines.append(f"\n**Active Downloads ({len(active_downloads)}):**")
-        for info in active_downloads.values():
-            size_str = format_size(info.get("size"))
-            lines.append(f"• `{info['name']}` ({size_str})")
-        lines.append("\n_Send /cancel to stop the active download._")
+    if current_download:
+        item = current_download["item"]
+        lines.append(f"\n**Currently Downloading:**\n• `{item['destination'].name}` ({format_size(item['file_size'])})")
     else:
-        lines.append("\n**Active Downloads:** None (idle)")
+        lines.append("\n**Currently Downloading:** None (idle)")
+
+    if queued_items:
+        lines.append(f"\n**Download Queue ({len(queued_items)}):**")
+        for idx, item in enumerate(queued_items, start=1):
+            lines.append(f"#{idx}: `{item['destination'].name}` ({format_size(item['file_size'])})")
+        lines.append("\n_Send /cancel to stop current download or reply /cancel to a queued item._")
+    else:
+        lines.append("**Download Queue:** Empty")
 
     await message.reply("\n".join(lines))
 
 
 async def handle_cancel_command(event) -> None:
-    """Handles /cancel command to stop active downloads."""
+    """Handles /cancel command to stop active download or dequeue items."""
+    global current_download
     message = event.message
     reply_to = message.reply_to_msg_id
 
-    target_id = None
+    # 1. Check if replying to a queued item
     if reply_to:
-        for msg_id, info in list(active_downloads.items()):
-            if msg_id == reply_to or info["status_msg"].id == reply_to:
-                target_id = msg_id
-                break
-    else:
-        if active_downloads:
-            target_id = list(active_downloads.keys())[-1]
+        for item in list(queued_items):
+            if item["message"].id == reply_to or item["status_msg"].id == reply_to:
+                item["cancelled"] = True
+                queued_items.remove(item)
+                try:
+                    await item["status_msg"].edit(
+                        f"**[CANCELLED] Removed from Queue**\n\n"
+                        f"**File:** `{item['destination'].name}`\n"
+                        f"**Status:** Item removed from download queue."
+                    )
+                    await message.delete()
+                except Exception:
+                    pass
+                return
 
-    if target_id and target_id in active_downloads:
-        download_info = active_downloads[target_id]
-        download_info["task"].cancel()
+        # Check if replying to the currently active download
+        if current_download:
+            active_item = current_download["item"]
+            if active_item["message"].id == reply_to or active_item["status_msg"].id == reply_to:
+                current_download["task"].cancel()
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                return
+
+    # 2. If not replying to a specific message, cancel the active download
+    if current_download:
+        current_download["task"].cancel()
         try:
             await message.delete()
         except Exception:
             pass
+    elif queued_items:
+        last_item = queued_items.pop()
+        last_item["cancelled"] = True
+        try:
+            await last_item["status_msg"].edit(
+                f"**[CANCELLED] Removed from Queue**\n\n"
+                f"**File:** `{last_item['destination'].name}`"
+            )
+            await message.delete()
+        except Exception:
+            pass
     else:
-        await message.reply("**[INFO] No active download found to cancel.**")
+        await message.reply("**[INFO] No active download or queued items to cancel.**")
+
+
+async def handle_deleted_messages(event) -> None:
+    """Triggered when messages are deleted in Saved Messages; auto-manages queue and active downloads."""
+    global current_download
+    deleted_ids = set(event.deleted_ids)
+
+    # 1. Check if the active downloading message was deleted
+    if current_download:
+        active_msg_id = current_download["item"]["message"].id
+        active_status_id = current_download["item"]["status_msg"].id
+        if active_msg_id in deleted_ids or active_status_id in deleted_ids:
+            logger.info(f"Active download message was deleted by user. Cancelling...")
+            current_download["task"].cancel()
+
+    # 2. Check if any queued item was deleted
+    for item in list(queued_items):
+        if item["message"].id in deleted_ids or item["status_msg"].id in deleted_ids:
+            logger.info(f"Queued message {item['destination'].name} was deleted by user. Removing from queue...")
+            item["cancelled"] = True
+            if item in queued_items:
+                queued_items.remove(item)
+            try:
+                await item["status_msg"].delete()
+            except Exception:
+                pass
 
 
 async def handle_new_saved_message(event) -> None:
@@ -464,24 +591,36 @@ async def handle_new_saved_message(event) -> None:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     destination = get_unique_filename(DOWNLOAD_DIR, raw_name)
 
-    logger.info(f"Incoming: {destination.name} ({format_size(file_size)})")
+    logger.info(f"Enqueued: {destination.name} ({format_size(file_size)})")
 
-    status_msg = await message.reply(
-        f"**[STARTING] Download Started**\n\n"
-        f"**File:** `{destination.name}`\n"
-        f"**Size:** `{format_size(file_size)}`\n"
-        f"**Folder:** `{destination.parent}`\n\n"
-        f"_Send /cancel to stop this download._"
-    )
+    is_busy = (current_download is not None) or (not download_queue.empty())
+    queue_pos = len(queued_items) + 1
 
-    task = asyncio.create_task(process_download(message, destination, file_size, status_msg))
-    active_downloads[message.id] = {
-        "task": task,
+    if is_busy:
+        status_msg = await message.reply(
+            f"**[QUEUED] Added to Queue (Position: #{queue_pos})**\n\n"
+            f"**File:** `{destination.name}`\n"
+            f"**Size:** `{format_size(file_size)}`\n\n"
+            f"_Will download automatically when earlier files finish._"
+        )
+    else:
+        status_msg = await message.reply(
+            f"**[STARTING] Preparing Download...**\n\n"
+            f"**File:** `{destination.name}`\n"
+            f"**Size:** `{format_size(file_size)}`\n"
+            f"**Folder:** `{destination.parent}`"
+        )
+
+    item = {
+        "message": message,
         "status_msg": status_msg,
-        "dest": destination,
-        "name": destination.name,
-        "size": file_size,
+        "destination": destination,
+        "file_size": file_size,
+        "cancelled": False,
     }
+
+    queued_items.append(item)
+    await download_queue.put(item)
 
 
 # -----------------------------------------------------------------------------
@@ -501,7 +640,9 @@ async def main() -> None:
 
     client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
 
+    # Listen to new and deleted messages in 'Saved Messages'
     client.add_event_handler(handle_new_saved_message, events.NewMessage(chats="me"))
+    client.add_event_handler(handle_deleted_messages, events.MessageDeleted(chats="me"))
 
     await client.start(phone=PHONE_NUMBER)
 
@@ -509,6 +650,9 @@ async def main() -> None:
     print(f"[STATUS] Connected as: {user.first_name} (ID: {user.id})")
     print("[STATUS] Commands: /help, /status, /cancel")
     print("[STATUS] Forward any file to 'Saved Messages' to download it.\n")
+
+    # Start the sequential queue worker
+    asyncio.create_task(queue_worker_loop(client))
 
     # Start background healthcheck heartbeat task if configured
     if HEALTHCHECK_URL:

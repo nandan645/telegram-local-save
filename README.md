@@ -27,7 +27,8 @@ Edit `.env`:
 ```env
 API_ID=12345678
 API_HASH=your_api_hash_here
-DOWNLOAD_DIR=./downloads
+DOWNLOAD_DIR=/HDD/Hard_Disk_Drive/Downloads/
+HEALTHCHECK_URL=https://hc-ping.com/5ec4eef6-440d-4825-9292-2d368be9d02f
 ```
 
 ---
@@ -40,42 +41,29 @@ python main.py
 
 ### Available Commands in Saved Messages:
 * **`/help`** or **`/start`** — Displays usage instructions, available commands, and server storage info.
-* **`/status`** — Checks server free disk space and active download progress.
-* **`/cancel`** — Cancels ongoing download and deletes incomplete files on the server.
+* **`/status`** — Checks server storage, active download progress, and the queued files list.
+* **`/cancel`** — Cancels the active download (or reply `/cancel` to a specific queued item).
 
-### Features:
-* **Auto-Delete:** Once a download finishes successfully, the original forwarded file is automatically deleted from your Saved Messages to keep Telegram clean.
-* **High-Speed Parallel:** Uses 8 parallel MTProto streams to maximize line speed.
+### Key Features:
+* **Sequential Queue:** Forward 10+ files at once; the bot processes them one by one at full speed without network congestion or rate limits.
+* **High-Speed Parallel Streams:** Uses 8 parallel MTProto streams per active download.
+* **Auto-Delete:** Once a download completes, the original forwarded message is automatically deleted from Telegram to free cloud storage.
+* **Uptime Monitoring:** Heartbeat integration with Healthchecks.io.
 
 ---
 
 ## 4. Run 24/7 on Linux Server (Systemd)
 
-1. Copy this project folder (including `telegram_session.session`) to your Linux server.
-2. Create a service file:
-   ```bash
-   sudo nano /etc/systemd/system/tg-downloader.service
-   ```
-3. Paste:
-   ```ini
-   [Unit]
-   Description=Telegram File Downloader
-   After=network.target
+Use the included [`telegram-downloader.service`](telegram-downloader.service) file:
 
-   [Service]
-   Type=simple
-   User=YOUR_LINUX_USERNAME
-   WorkingDirectory=/home/YOUR_LINUX_USERNAME/telegram_downloader
-   ExecStart=/usr/bin/python3 /home/YOUR_LINUX_USERNAME/telegram_downloader/main.py
-   Restart=always
-   RestartSec=5
+```bash
+# Copy service file
+sudo cp telegram-downloader.service /etc/systemd/system/
 
-   [Install]
-   WantedBy=multi-user.target
-   ```
-4. Start it:
-   ```bash
-   sudo systemctl enable --now tg-downloader
-   ```
+# Reload & start
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-downloader
 
-To check logs: `journalctl -u tg-downloader -f`
+# Check logs
+journalctl -u telegram-downloader -f
+```
